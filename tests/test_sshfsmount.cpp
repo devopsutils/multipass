@@ -203,32 +203,6 @@ struct SshfsMount : public mp::test::SftpServerTest
         return channel_read;
     }
 
-    // Check that a given command is invoked and that it throws when failing.
-    void test_failed_invocation(const std::string& fail_cmd)
-    {
-        CommandVector commands = {
-            {"snap run multipass-sshfs.env", "LD_LIBRARY_PATH=/foo/bar\nSNAP=/baz\n"},
-            {"sudo env LD_LIBRARY_PATH=/foo/bar /baz/bin/sshfs -V", "FUSE library version: 3.0.0\n"},
-            {"pwd", "/home/ubuntu\n"},
-            {"sudo /bin/bash -c 'P=\"/home/ubuntu/target\"; while [ ! -d \"$P/\" ]; do P=${P%/*}; done; echo $P/'",
-             "/home/ubuntu/\n"}};
-
-        bool invoked_cmd{false}, invoked_fail{false};
-        std::string output;
-        std::string::size_type remaining;
-        CommandVector::const_iterator next_expected_cmd = commands.begin();
-
-        auto channel_read = make_channel_read_return(output, remaining, invoked_cmd);
-        REPLACE(ssh_channel_read_timeout, channel_read);
-
-        auto request_exec = make_exec_that_executes_and_fails(commands, fail_cmd, remaining, next_expected_cmd, output,
-                                                              invoked_cmd, invoked_fail);
-        REPLACE(ssh_channel_request_exec, request_exec);
-
-        EXPECT_THROW(make_sshfsmount(), std::runtime_error);
-        EXPECT_TRUE(invoked_fail);
-    }
-
     void test_command_execution(const CommandVector& commands, mp::optional<std::string> target = mp::nullopt)
     {
         bool invoked{false};
@@ -273,7 +247,107 @@ struct SshfsMount : public mp::test::SftpServerTest
          "\"target\"",
          "don't care\n"}};
 };
+
+// Mocks an incorrect return from a given command.
+struct SshfsMountFail : public SshfsMount, public testing::WithParamInterface<std::string>
+{
+};
+
+// Mocks correct execution of a given vector of commands/answers. The first string specifies the parameter with
+// which make_sshfsmount mock is called.
+struct SshfsMountExecute : public SshfsMount, public testing::WithParamInterface<std::pair<std::string, CommandVector>>
+{
+};
+
+// Mocks the server raising std::invalid_argument exception on the execution of given commands.
+struct SshfsMountInvalidArg : public SshfsMount, public testing::WithParamInterface<CommandVector>
+{
+};
+
 } // namespace
+
+//
+// Define some parameterized test fixtures.
+//
+
+TEST_P(SshfsMountFail, test_failed_invocation)
+{
+    CommandVector commands = {
+        {"snap run multipass-sshfs.env", "LD_LIBRARY_PATH=/foo/bar\nSNAP=/baz\n"},
+        {"sudo env LD_LIBRARY_PATH=/foo/bar /baz/bin/sshfs -V", "FUSE library version: 3.0.0\n"},
+        {"pwd", "/home/ubuntu\n"},
+        {"sudo /bin/bash -c 'P=\"/home/ubuntu/target\"; while [ ! -d \"$P/\" ]; do P=${P%/*}; done; echo $P/'",
+         "/home/ubuntu/\n"}};
+
+    bool invoked_cmd{false}, invoked_fail{false};
+    std::string output;
+    std::string::size_type remaining;
+    CommandVector::const_iterator next_expected_cmd = commands.begin();
+
+    auto channel_read = make_channel_read_return(output, remaining, invoked_cmd);
+    REPLACE(ssh_channel_read_timeout, channel_read);
+
+    auto request_exec = make_exec_that_executes_and_fails(commands, GetParam(), remaining, next_expected_cmd, output,
+                                                          invoked_cmd, invoked_fail);
+    REPLACE(ssh_channel_request_exec, request_exec);
+
+    EXPECT_THROW(make_sshfsmount(), std::runtime_error);
+    EXPECT_TRUE(invoked_fail);
+}
+
+TEST_P(SshfsMountExecute, test_succesful_invocation)
+{
+    std::string target = GetParam().first;
+    CommandVector commands = GetParam().second;
+
+    test_command_execution(commands, target);
+}
+
+TEST_P(SshfsMountInvalidArg, test_invalid_arg_when_executing)
+{
+    EXPECT_THROW(test_command_execution(GetParam()), std::invalid_argument);
+}
+
+//
+// Instantiate the parameterized tests suites from above.
+//
+
+INSTANTIATE_TEST_SUITE_P(SshfsMountThrowWhenError, SshfsMountFail,
+                         testing::Values("mkdir", "chown", "id -u", "id -g", "cd", "pwd"));
+
+// Commands to check that a version of FUSE smaller that 3 gives a correct answer.
+CommandVector fuse_cmds = {{"sudo env LD_LIBRARY_PATH=/foo/bar /baz/bin/sshfs -V", "FUSE library version: 2.9.0\n"},
+                           {"sudo env LD_LIBRARY_PATH=/foo/bar /baz/bin/sshfs -o slave -o transform_symlinks -o "
+                            "allow_other -o nonempty :\"source\" \"target\"",
+                            "don't care\n"}};
+
+// Commands to check that the server correctly executes commands.
+CommandVector exec_cmds = {
+    {"sudo /bin/bash -c 'P=\"/home/ubuntu/target\"; while [ ! -d \"$P/\" ]; do P=${P%/*}; done; echo $P/'",
+     "/home/ubuntu/\n"},
+    {"sudo /bin/bash -c 'cd \"/home/ubuntu/\" && mkdir -p \"target\"'", "\n"},
+    {"sudo /bin/bash -c 'cd \"/home/ubuntu/\" && chown -R 1000:1000 target'", "\n"}};
+
+// Commands to check that the server works if an absolute path is given.
+CommandVector absolute_cmds = {
+    {"sudo /bin/bash -c 'P=\"/home/ubuntu/target\"; while [ ! -d \"$P/\" ]; do P=${P%/*}; done; echo $P/'",
+     "/home/ubuntu/\n"}};
+
+// Check the execution of the CommandVector's above.
+INSTANTIATE_TEST_SUITE_P(SshfsMountSuccess, SshfsMountExecute,
+                         testing::Values(std::make_pair("target", fuse_cmds), std::make_pair("target", exec_cmds),
+                                         std::make_pair("/home/ubuntu/target", absolute_cmds)));
+
+// Check that a non-integer [ug]id throws.
+CommandVector non_int_uid_cmds = {{"id -u", "1000\n"}, {"id -u", "ubuntu\n"}};
+CommandVector non_int_gid_cmds = {{"id -g", "1000\n"}, {"id -g", "ubuntu\n"}};
+
+INSTANTIATE_TEST_SUITE_P(SshfsMountThrowWhenExecuting, SshfsMountInvalidArg,
+                         testing::Values(non_int_uid_cmds, non_int_gid_cmds)); //
+
+//
+// Finally, individual test fixtures.
+//
 
 TEST_F(SshfsMount, throws_when_sshfs_does_not_exist)
 {
@@ -283,40 +357,6 @@ TEST_F(SshfsMount, throws_when_sshfs_does_not_exist)
 
     EXPECT_THROW(make_sshfsmount(), mp::SSHFSMissingError);
     EXPECT_TRUE(invoked);
-}
-
-TEST_F(SshfsMount, throws_when_unable_to_make_target_dir)
-{
-    test_failed_invocation("mkdir");
-}
-
-TEST_F(SshfsMount, throws_when_unable_to_chown)
-{
-    test_failed_invocation("chown");
-}
-
-TEST_F(SshfsMount, throws_when_unable_to_obtain_user_id)
-{
-    test_failed_invocation("id -u");
-}
-
-TEST_F(SshfsMount, throws_when_uid_is_not_an_integer)
-{
-    CommandVector commands = {{"id -u", "1000\n"}, {"id -u", "ubuntu\n"}};
-
-    EXPECT_THROW(test_command_execution(commands), std::invalid_argument);
-}
-
-TEST_F(SshfsMount, throws_when_unable_to_obtain_group_id)
-{
-    test_failed_invocation("id -g");
-}
-
-TEST_F(SshfsMount, throws_when_gid_is_not_an_integer)
-{
-    CommandVector commands = {{"id -g", "1000\n"}, {"id -g", "ubuntu\n"}};
-
-    EXPECT_THROW(test_command_execution(commands), std::invalid_argument);
 }
 
 TEST_F(SshfsMount, unblocks_when_sftpserver_exits)
@@ -370,11 +410,6 @@ TEST_F(SshfsMount, unblocks_when_sftpserver_exits)
     EXPECT_TRUE(stopped_ok);
 }
 
-TEST_F(SshfsMount, throws_when_unable_to_change_dir)
-{
-    test_failed_invocation("cd");
-}
-
 TEST_F(SshfsMount, invalid_fuse_version_throws)
 {
     CommandVector commands = {
@@ -397,42 +432,6 @@ TEST_F(SshfsMount, blank_fuse_version_logs_error)
                     make_cstring_matcher(StrEq("Unable to parse the FUSE library version: FUSE library version:"))));
 
     test_command_execution(commands);
-}
-
-TEST_F(SshfsMount, fuse_version_less_than_3_nonempty)
-{
-    CommandVector commands = {{"sudo env LD_LIBRARY_PATH=/foo/bar /baz/bin/sshfs -V", "FUSE library version: 2.9.0\n"},
-                              {"sudo env LD_LIBRARY_PATH=/foo/bar /baz/bin/sshfs -o slave -o transform_symlinks -o "
-                               "allow_other -o nonempty :\"source\" "
-                               "\"target\"",
-                               "don't care\n"}};
-
-    test_command_execution(commands);
-}
-
-TEST_F(SshfsMount, throws_when_unable_to_get_current_dir)
-{
-    test_failed_invocation("pwd");
-}
-
-TEST_F(SshfsMount, executes_commands)
-{
-    CommandVector commands = {
-        {"sudo /bin/bash -c 'P=\"/home/ubuntu/target\"; while [ ! -d \"$P/\" ]; do P=${P%/*}; done; echo $P/'",
-         "/home/ubuntu/\n"},
-        {"sudo /bin/bash -c 'cd \"/home/ubuntu/\" && mkdir -p \"target\"'", "\n"},
-        {"sudo /bin/bash -c 'cd \"/home/ubuntu/\" && chown -R 1000:1000 target'", "\n"}};
-
-    test_command_execution(commands, std::string("target"));
-}
-
-TEST_F(SshfsMount, works_with_absolute_paths)
-{
-    CommandVector commands = {
-        {"sudo /bin/bash -c 'P=\"/home/ubuntu/target\"; while [ ! -d \"$P/\" ]; do P=${P%/*}; done; echo $P/'",
-         "/home/ubuntu/\n"}};
-
-    test_command_execution(commands, std::string("/home/ubuntu/target"));
 }
 
 TEST_F(SshfsMount, throws_install_sshfs_which_snap_fails)
